@@ -1,244 +1,140 @@
-# import os
-# import io
-# import shutil
-# import zipfile
-# import tempfile
-# import requests
-# import dicom2nifti
-# from pathlib import Path
-# import pandas as pd
-# from src.configuration.config import ABDOMEN_STUDY_REGEX, SUB_BODY_PARTS
-
-# # Base workspace directory: ~/rp-radar-service
-# BASE_DIR = Path(__file__).resolve().parent.parent
-
-# # Persistent cache directory: stores {study_id}.nii.gz
-# NIFTI_CACHE_DIR = BASE_DIR / "nifti_cache"
-# NIFTI_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
-# # Temporary scratch space: stores transient DICOM downloads/conversions
-# TMP_SCRATCH_DIR = BASE_DIR / "tmp" / "dicom_scratch"
-# TMP_SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
-
-# ORTHANC_URL = os.getenv("ORTHANC_URL", "http://localhost:8042")
-# ORTHANC_USER = os.getenv("ORTHANC_USER", "orthanc")
-# ORTHANC_PASS = os.getenv("ORTHANC_PASS", "orthanc")
-# ORTHANC_AUTH = (ORTHANC_USER, ORTHANC_PASS) if ORTHANC_USER else None
-
-
-# def resolve_orthanc_study(study_id: str) -> str:
-#     """
-#     Resolves a DICOM StudyInstanceUID or internal identifier to an Orthanc Study ID.
-#     """
-#     try:
-#         res = requests.get(f"{ORTHANC_URL}/studies/{study_id}", auth=ORTHANC_AUTH, timeout=10)
-#         if res.status_code == 200:
-#             return study_id
-
-#         lookup_res = requests.post(f"{ORTHANC_URL}/tools/lookup", auth=ORTHANC_AUTH, json=[study_id], timeout=10).json()
-#         for item in lookup_res:
-#             if item.get("Type") == "Study":
-#                 return item.get("ID")
-#     except Exception as e:
-#         print(f"[!] Error resolving study identifier '{study_id}': {e}")
-#     return None
-
-
-# def get_verified_abdomen_series(orthanc_study_id: str) -> str:
-#     """
-#     Selects the most suitable abdominal CT series within the study.
-#     Validates modality (CT) and checks descriptions for abdominal keywords.
-#     """
-#     url = f"{ORTHANC_URL}/studies/{orthanc_study_id}/series"
-#     series_list = requests.get(url, auth=ORTHANC_AUTH, timeout=10).json()
-
-#     # Preferred match: modality is CT and description/body part indicates abdomen
-#     for s in series_list:
-#         tags = s.get("MainDicomTags", {})
-#         modality = tags.get("Modality", "")
-#         desc = tags.get("SeriesDescription", "").lower()
-#         body_part = tags.get("BodyPartExamined", "").lower()
-
-#         if modality == "CT" and any(k in desc or k in body_part for k in ["abd", "abdo", "kub", "pelvis"]):
-#             return s["ID"]
-
-#     # Fallback match: first available CT series in the study
-#     for s in series_list:
-#         if s.get("MainDicomTags", {}).get("Modality", "") == "CT":
-#             return s["ID"]
-
-#     return None
-
-
-# def get_or_create_nifti(study_id: str) -> str:
-#     """
-#     Retrieves the cached NIfTI file or downloads and converts it from Orthanc.
-#     Scratch DICOM files are deleted immediately after conversion.
-#     """
-#     cached_nii_path = NIFTI_CACHE_DIR / f"{study_id}.nii.gz"
-
-#     # 1. Cache hit check
-#     if cached_nii_path.exists() and cached_nii_path.stat().st_size > 0:
-#         print(f"[*] Cache Hit: Using existing NIfTI at {cached_nii_path}")
-#         return str(cached_nii_path)
-
-#     # 2. Cache miss: verify study in Orthanc
-#     print(f"[*] Cache Miss: Resolving study '{study_id}' in Orthanc...")
-#     orthanc_study_id = resolve_orthanc_study(study_id)
-#     if not orthanc_study_id:
-#         raise ValueError(f"Study ID '{study_id}' could not be resolved in Orthanc.")
-
-#     series_id = get_verified_abdomen_series(orthanc_study_id)
-#     if not series_id:
-#         raise ValueError(f"No suitable CT series found for study '{study_id}' in Orthanc.")
-
-#     # 3. Download and convert using a self-destructing temporary directory
-#     with tempfile.TemporaryDirectory(dir=str(TMP_SCRATCH_DIR)) as run_scratch:
-#         dicom_dir = Path(run_scratch) / "dicoms"
-#         nii_out_dir = Path(run_scratch) / "nifti_out"
-#         dicom_dir.mkdir(parents=True, exist_ok=True)
-#         nii_out_dir.mkdir(parents=True, exist_ok=True)
-
-#         print(f"    -> Downloading DICOM archive for series '{series_id}'...")
-#         archive_url = f"{ORTHANC_URL}/series/{series_id}/archive"
-#         resp = requests.get(archive_url, auth=ORTHANC_AUTH, stream=True, timeout=120)
-#         resp.raise_for_status()
-
-#         with zipfile.ZipFile(io.BytesIO(resp.content)) as z:
-#             z.extractall(dicom_dir)
-
-#         print(f"    -> Converting DICOM series to NIfTI format...")
-#         dicom2nifti.convert_directory(str(dicom_dir), str(nii_out_dir), compression=True, reorient=True)
-
-#         nii_candidates = list(nii_out_dir.glob("*.nii.gz"))
-#         if not nii_candidates:
-#             raise RuntimeError(f"dicom2nifti produced no .nii.gz files for series '{series_id}'.")
-
-#         # Select primary reconstructed volume (ignoring scouts/localizers by file size)
-#         primary_volume = max(nii_candidates, key=lambda f: f.stat().st_size)
-
-#         # Move to persistent cache
-#         shutil.move(str(primary_volume), str(cached_nii_path))
-
-#     # All files inside run_scratch are automatically removed upon exiting the block
-#     print(f"[✓] NIfTI conversion complete. Cached at: {cached_nii_path}")
-#     return str(cached_nii_path)
-
-
-# def wipe_tmp_scratch():
-#     """
-#     Utility function to clear any residual temporary artifacts inside tmp/.
-#     """
-#     if TMP_SCRATCH_DIR.exists():
-#         for item in TMP_SCRATCH_DIR.iterdir():
-#             if item.is_dir():
-#                 shutil.rmtree(item, ignore_errors=True)
-#             else:
-#                 item.unlink(missing_ok=True)
-
-
-
-
-# def check_orthanc_study_eligible(pacs_url: str, study_id: str, auth_tuple: tuple = None):
-#     """Checks whether the study exists and has an abdominal CT series."""
-#     try:
-#         # Check direct study endpoint or lookup
-#         res = requests.get(f"{pacs_url}/studies/{study_id}", auth=auth_tuple, timeout=10)
-#         orthanc_id = study_id
-#         if res.status_code != 200:
-#             lookup = requests.post(f"{pacs_url}/tools/lookup", auth=auth_tuple, json=[study_id], timeout=10).json()
-#             matches = [item["ID"] for item in lookup if item.get("Type") == "Study"]
-#             if not matches:
-#                 return False, None, "Study not found in Orthanc"
-#             orthanc_id = matches[0]
-
-#         # Inspect series descriptions
-#         series_list = requests.get(f"{pacs_url}/studies/{orthanc_id}/series", auth=auth_tuple, timeout=10).json()
-#         for s in series_list:
-#             tags = s.get("MainDicomTags", {})
-#             modality = tags.get("Modality", "")
-#             desc = tags.get("SeriesDescription", "")
-#             if modality == "CT" and ABDOMEN_STUDY_REGEX.search(desc):
-#                 return True, orthanc_id, desc
-
-#         return False, orthanc_id, "No matching abdominal CT series found"
-#     except Exception as e:
-#         return False, None, str(e)
-
-
-# def resolve_body_part_label(desc_text: str) -> str:
-#     """Resolves specific sub-anatomical body part or defaults to abdomen."""
-#     for part, regex in SUB_BODY_PARTS.items():
-#         if regex.search(desc_text):
-#             return part
-#     return "abdomen"
-
-
-# def parse_radar_csv_output(csv_path: str, threshold: float = 0.60) -> list:
-#     """Reads inference CSV and filters findings exceeding the confidence threshold."""
-#     if not os.path.exists(csv_path):
-#         return []
-    
-#     df = pd.read_csv(csv_path)
-#     # Handles both (finding, probability) and wide-column CSV formats
-#     abnormalities = []
-#     if "finding" in df.columns and "probability" in df.columns:
-#         filtered = df[df["probability"] >= threshold]
-#         abnormalities = filtered["finding"].tolist()
-#     else:
-#         for col in df.columns:
-#             if col.startswith("radar_") or col in df.columns:
-#                 val = float(df[col].iloc[0])
-#                 if val >= threshold:
-#                     abnormalities.append(col.replace("radar_", ""))
-#     return abnormalities
-
 
 import os
 import io
+import sys
 import shutil
 import zipfile
 import tempfile
 import requests
+import pydicom
 import dicom2nifti
+import pandas as pd
+import torch
 from pathlib import Path
+import dicom2nifti.settings as d2n_settings
+import SimpleITK as sitk
+
 from src.configuration.config import ABDOMEN_STUDY_REGEX, SUB_BODY_PARTS
 
+# Resolve paths
 BASE_DIR = Path(__file__).resolve().parent.parent
+CKPT_DIR = BASE_DIR / "ckpt"
+RADAR_INFERENCE_DIR = BASE_DIR / "RADAR_inference"
+
+# Ensure imports resolve
+if str(RADAR_INFERENCE_DIR) not in sys.path:
+    sys.path.insert(0, str(RADAR_INFERENCE_DIR))
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+
+# Caching directories
 NIFTI_CACHE_DIR = BASE_DIR / "nifti_cache"
 NIFTI_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 TMP_SCRATCH_DIR = BASE_DIR / "tmp" / "dicom_scratch"
 TMP_SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
 
+# Environmental variables required by RADAR
+os.environ["MODEL_ROOT"] = str(CKPT_DIR)
+os.environ["CONFIGS_ROOT"] = str(CKPT_DIR)
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
+# Global model state holders for in-memory persistence
+_PAD_FUNC = None
+_MODEL = None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. PACS & DICOM Processing
+# ─────────────────────────────────────────────────────────────────────────────
 def check_orthanc_study_eligible(pacs_url: str, study_id: str, auth_tuple: tuple = None):
-    """Verifies that the study exists and has an abdominal CT series."""
+    """
+    Validates that:
+    1. The study is an Abdominal CT (checks StudyDescription, SeriesDescription, and BodyPartExamined).
+    2. A valid volumetric 3D CT series exists (>= 30 axial slices, non-scout).
+    Rejects any non-abdomen studies explicitly.
+    """
     try:
-        res = requests.get(f"{pacs_url}/studies/{study_id}", auth=auth_tuple, timeout=10)
+        pacs_root = pacs_url.rstrip("/")
+        study_url = f"{pacs_root}/studies/{study_id}"
+        res = requests.get(study_url, auth=auth_tuple, timeout=15)
         orthanc_id = study_id
-        if res.status_code != 200:
-            lookup = requests.post(f"{pacs_url}/tools/lookup", auth=auth_tuple, json=[study_id], timeout=10).json()
-            matches = [item["ID"] for item in lookup if item.get("Type") == "Study"]
-            if not matches:
-                return False, None, "Study not found in Orthanc"
-            orthanc_id = matches[0]
 
-        series_list = requests.get(f"{pacs_url}/studies/{orthanc_id}/series", auth=auth_tuple, timeout=10).json()
+        # 1. Resolve internal Orthanc ID if a DICOM StudyInstanceUID was passed
+        if res.status_code == 404:
+            find_resp = requests.post(
+                f"{pacs_root}/tools/find",
+                auth=auth_tuple,
+                json={"Level": "Study", "Query": {"StudyInstanceUID": study_id}},
+                timeout=15,
+            )
+            if find_resp.status_code == 200 and find_resp.json():
+                orthanc_id = find_resp.json()[0]
+                res = requests.get(f"{pacs_root}/studies/{orthanc_id}", auth=auth_tuple, timeout=15)
+            else:
+                return False, None, f"Study ID '{study_id}' not found in Orthanc"
+
+        if res.status_code != 200:
+            return False, None, f"Orthanc returned HTTP {res.status_code}"
+
+        # 2. Check Study-Level Metadata (StudyDescription)
+        study_data = res.json()
+        study_tags = study_data.get("MainDicomTags", {})
+        study_desc = (study_tags.get("StudyDescription") or "").strip()
+        study_is_abdomen = bool(ABDOMEN_STUDY_REGEX.search(study_desc))
+
+        # 3. Retrieve Series List
+        series_resp = requests.get(f"{pacs_root}/studies/{orthanc_id}/series", auth=auth_tuple, timeout=15)
+        if series_resp.status_code != 200:
+            return False, orthanc_id, "Failed to retrieve series metadata from Orthanc"
+
+        series_list = series_resp.json()
+        candidate_series = []
+
         for s in series_list:
             tags = s.get("MainDicomTags", {})
             modality = tags.get("Modality", "")
-            desc = tags.get("SeriesDescription", "")
-            body_part = tags.get("BodyPartExamined", "")
-            combined_desc = f"{desc} {body_part}".strip()
+            s_desc = (tags.get("SeriesDescription") or "").strip()
+            body_part = (tags.get("BodyPartExamined") or "").strip()
+            combined_series_text = f"{s_desc} {body_part}".strip()
+            num_instances = len(s.get("Instances", []))
 
-            if modality == "CT" and ABDOMEN_STUDY_REGEX.search(combined_desc):
-                return True, orthanc_id, combined_desc
+            s_desc_lower = s_desc.lower()
+            is_scout = any(k in s_desc_lower for k in ["scout", "topogram", "localizer", "survey"])
 
-        return False, orthanc_id, "No matching abdominal CT series found"
+            # Must be a 3D CT volume, not a scout/localizer
+            if modality == "CT" and not is_scout and num_instances >= 30:
+                series_is_abdomen = bool(ABDOMEN_STUDY_REGEX.search(combined_series_text))
+                candidate_series.append({
+                    "id": s["ID"],
+                    "instances": num_instances,
+                    "desc": combined_series_text,
+                    "is_abdomen": series_is_abdomen
+                })
+
+        if not candidate_series:
+            return False, orthanc_id, "No valid 3D CT volume (>= 30 slices) found in this study"
+
+        # 4. Strict Abdomen Validation
+        # Valid only if StudyDescription matches OR at least one CT series indicates abdomen/pelvis
+        has_abdomen = study_is_abdomen or any(c["is_abdomen"] for c in candidate_series)
+
+        if not has_abdomen:
+            label = study_desc or candidate_series[0]["desc"] or "Unknown"
+            return False, orthanc_id, f"This scan is not an Abdominal CT (Detected: '{label}')"
+
+        # Pick the series with the most slices as primary volume
+        candidate_series.sort(key=lambda x: x["instances"], reverse=True)
+        primary_series = candidate_series[0]
+        resolved_desc = study_desc or primary_series["desc"] or "CT Abdomen"
+
+        return True, orthanc_id, resolved_desc
+
+    except requests.exceptions.RequestException as e:
+        return False, None, f"PACS network error: {str(e)}"
     except Exception as e:
-        return False, None, str(e)
-
+        return False, None, f"Error validating study: {str(e)}"
+    
 
 def resolve_body_part_label(desc_text: str) -> str:
     """Extracts sub-anatomical body part or defaults to abdomen."""
@@ -248,50 +144,200 @@ def resolve_body_part_label(desc_text: str) -> str:
     return "abdomen"
 
 
+# def get_or_create_nifti(pacs_url: str, study_id: str, auth_tuple: tuple = None) -> str:
+#     """Fetches cached NIfTI or downloads DICOM from Orthanc, flattens slices, and converts it."""
+#     cached_nii_path = NIFTI_CACHE_DIR / f"{study_id}.nii.gz"
+
+#     if cached_nii_path.exists() and cached_nii_path.stat().st_size > 0:
+#         print(f"[*] Cache Hit: Using {cached_nii_path}")
+#         return str(cached_nii_path)
+
+#     print(f"[*] Cache Miss: Resolving series for study {study_id}...")
+#     url = f"{pacs_url}/studies/{study_id}/series"
+#     series_list = requests.get(url, auth=auth_tuple, timeout=10).json()
+
+#     # Filter out scouts/localizers and non-CT series
+#     valid_series = []
+#     for s in series_list:
+#         tags = s.get("MainDicomTags", {})
+#         instances = s.get("Instances", [])
+#         num_instances = len(instances)
+#         desc = tags.get("SeriesDescription", "").lower()
+#         modality = tags.get("Modality", "")
+
+#         is_scout = any(k in desc for k in ["scout", "topogram", "localizer", "survey"])
+#         if modality == "CT" and not is_scout and num_instances >= 15:
+#             valid_series.append((s["ID"], num_instances, desc))
+
+#     if not valid_series:
+#         ct_candidates = [
+#             (s["ID"], len(s.get("Instances", [])), s.get("MainDicomTags", {}).get("SeriesDescription", ""))
+#             for s in series_list
+#             if s.get("MainDicomTags", {}).get("Modality", "") == "CT" and len(s.get("Instances", [])) >= 10
+#         ]
+#         if not ct_candidates:
+#             raise ValueError(f"No valid 3D CT volume found in study {study_id}")
+#         valid_series = ct_candidates
+
+#     # Pick the series with the highest slice count
+#     valid_series.sort(key=lambda x: x[1], reverse=True)
+#     selected_series_id, slice_count, desc = valid_series[0]
+#     print(f"[*] Selected series '{selected_series_id}' with {slice_count} slices.")
+
+#     with tempfile.TemporaryDirectory(dir=str(TMP_SCRATCH_DIR)) as run_scratch:
+#         extract_dir = Path(run_scratch) / "raw_extracted"
+#         flat_dicom_dir = Path(run_scratch) / "flat_dicoms"
+#         nii_out_dir = Path(run_scratch) / "nifti_out"
+
+#         extract_dir.mkdir(parents=True, exist_ok=True)
+#         flat_dicom_dir.mkdir(parents=True, exist_ok=True)
+#         nii_out_dir.mkdir(parents=True, exist_ok=True)
+
+#         resp = requests.get(f"{pacs_url}/series/{selected_series_id}/archive", auth=auth_tuple, stream=True, timeout=300)
+#         resp.raise_for_status()
+
+#         with zipfile.ZipFile(io.BytesIO(resp.content)) as z:
+#             z.extractall(extract_dir)
+
+#         # Collect only valid DICOM slices into a flat folder
+#         valid_slices = 0
+#         for root, _, files in os.walk(extract_dir):
+#             for f in files:
+#                 filepath = os.path.join(root, f)
+#                 try:
+#                     pydicom.dcmread(filepath, stop_before_pixels=True)
+#                     shutil.copy(filepath, flat_dicom_dir / f"{valid_slices}_{f}")
+#                     valid_slices += 1
+#                 except Exception:
+#                     continue
+
+#         if valid_slices < 10:
+#             raise ValueError(f"Only {valid_slices} DICOM slices extracted; minimum required is 10.")
+
+#         print(f"    -> Extracted {valid_slices} slices. Converting to NIfTI...")
+#         dicom2nifti.convert_directory(str(flat_dicom_dir), str(nii_out_dir), compression=True, reorient=True)
+
+#         nii_candidates = list(nii_out_dir.glob("*.nii.gz"))
+#         if not nii_candidates:
+#             raise RuntimeError(f"dicom2nifti failed to create .nii.gz for series '{selected_series_id}'.")
+
+#         primary_volume = max(nii_candidates, key=lambda f: f.stat().st_size)
+#         shutil.move(str(primary_volume), str(cached_nii_path))
+
+#     return str(cached_nii_path)
 def get_or_create_nifti(pacs_url: str, study_id: str, auth_tuple: tuple = None) -> str:
-    """Fetches cached NIfTI or downloads DICOM from Orthanc and converts it."""
+    """
+    Downloads DICOM slices from Orthanc, flattens them, and converts to NIfTI.
+    Bypasses slice increment checks and uses SimpleITK fallback to handle irregular CT geometry.
+    """
     cached_nii_path = NIFTI_CACHE_DIR / f"{study_id}.nii.gz"
 
     if cached_nii_path.exists() and cached_nii_path.stat().st_size > 0:
         print(f"[*] Cache Hit: Using {cached_nii_path}")
         return str(cached_nii_path)
 
-    print(f"[*] Cache Miss: Downloading DICOMs for study {study_id}...")
-    url = f"{pacs_url}/studies/{study_id}/series"
-    series_list = requests.get(url, auth=auth_tuple, timeout=10).json()
+    print(f"[*] Cache Miss: Resolving series for study {study_id}...")
+    url = f"{pacs_url.rstrip('/')}/studies/{study_id}/series"
+    series_resp = requests.get(url, auth=auth_tuple, timeout=15)
+    series_resp.raise_for_status()
+    series_list = series_resp.json()
 
-    series_id = None
+    # Filter out scouts/localizers and non-CT series
+    valid_series = []
     for s in series_list:
         tags = s.get("MainDicomTags", {})
-        if tags.get("Modality") == "CT":
-            series_id = s["ID"]
-            break
+        instances = s.get("Instances", [])
+        num_instances = len(instances)
+        desc = tags.get("SeriesDescription", "").lower()
+        modality = tags.get("Modality", "")
 
-    if not series_id:
-        raise ValueError(f"No CT series found in study {study_id}")
+        is_scout = any(k in desc for k in ["scout", "topogram", "localizer", "survey"])
+        if modality == "CT" and not is_scout and num_instances >= 15:
+            valid_series.append((s["ID"], num_instances, desc))
+
+    if not valid_series:
+        ct_candidates = [
+            (s["ID"], len(s.get("Instances", [])), s.get("MainDicomTags", {}).get("SeriesDescription", ""))
+            for s in series_list
+            if s.get("MainDicomTags", {}).get("Modality", "") == "CT" and len(s.get("Instances", [])) >= 10
+        ]
+        if not ct_candidates:
+            raise ValueError(f"No valid 3D CT volume found in study {study_id}")
+        valid_series = ct_candidates
+
+    # Pick the series with the highest slice count
+    valid_series.sort(key=lambda x: x[1], reverse=True)
+    selected_series_id, slice_count, desc = valid_series[0]
+    print(f"[*] Selected series '{selected_series_id}' with {slice_count} slices.")
 
     with tempfile.TemporaryDirectory(dir=str(TMP_SCRATCH_DIR)) as run_scratch:
-        dicom_dir = Path(run_scratch) / "dicoms"
+        extract_dir = Path(run_scratch) / "raw_extracted"
+        flat_dicom_dir = Path(run_scratch) / "flat_dicoms"
         nii_out_dir = Path(run_scratch) / "nifti_out"
-        dicom_dir.mkdir(parents=True, exist_ok=True)
+
+        extract_dir.mkdir(parents=True, exist_ok=True)
+        flat_dicom_dir.mkdir(parents=True, exist_ok=True)
         nii_out_dir.mkdir(parents=True, exist_ok=True)
 
-        resp = requests.get(f"{pacs_url}/series/{series_id}/archive", auth=auth_tuple, stream=True, timeout=180)
+        resp = requests.get(f"{pacs_url.rstrip('/')}/series/{selected_series_id}/archive", auth=auth_tuple, stream=True, timeout=300)
         resp.raise_for_status()
 
         with zipfile.ZipFile(io.BytesIO(resp.content)) as z:
-            z.extractall(dicom_dir)
+            z.extractall(extract_dir)
 
-        dicom2nifti.convert_directory(str(dicom_dir), str(nii_out_dir), compression=True, reorient=True)
-        nii_candidates = list(nii_out_dir.glob("*.nii.gz"))
-        if not nii_candidates:
-            raise RuntimeError(f"dicom2nifti produced no .nii.gz files for series '{series_id}'.")
+        # Collect only valid DICOM slices into a flat folder
+        valid_slices = 0
+        for root, _, files in os.walk(extract_dir):
+            for f in files:
+                filepath = os.path.join(root, f)
+                try:
+                    pydicom.dcmread(filepath, stop_before_pixels=True)
+                    shutil.copy(filepath, flat_dicom_dir / f"{valid_slices}_{f}")
+                    valid_slices += 1
+                except Exception:
+                    continue
 
-        primary_volume = max(nii_candidates, key=lambda f: f.stat().st_size)
-        shutil.move(str(primary_volume), str(cached_nii_path))
+        if valid_slices < 10:
+            raise ValueError(f"Only {valid_slices} DICOM slices extracted; minimum required is 10.")
+
+        print(f"    -> Extracted {valid_slices} slices. Converting to NIfTI...")
+
+        # 1. Primary conversion using dicom2nifti with relaxed validation
+        d2n_settings.disable_validate_slice_increment()
+        d2n_settings.disable_validate_orthogonal()
+        d2n_settings.enable_resampling()
+        d2n_settings.set_resample_spline_interpolation_order(1)
+
+        conversion_successful = False
+        try:
+            dicom2nifti.convert_directory(str(flat_dicom_dir), str(nii_out_dir), compression=True, reorient=True)
+            nii_candidates = list(nii_out_dir.glob("*.nii.gz"))
+            if nii_candidates:
+                primary_volume = max(nii_candidates, key=lambda f: f.stat().st_size)
+                shutil.move(str(primary_volume), str(cached_nii_path))
+                conversion_successful = True
+                print(f"[✓] Converted via dicom2nifti: {cached_nii_path}")
+        except Exception as e:
+            print(f"[!] dicom2nifti conversion failed ({e}). Proceeding to SimpleITK fallback...")
+
+        # 2. Resilient fallback using SimpleITK if dicom2nifti fails
+        if not conversion_successful:
+            try:
+                reader = sitk.ImageSeriesReader()
+                dicom_names = reader.GetGDCMSeriesFileNames(str(flat_dicom_dir))
+                if not dicom_names:
+                    raise RuntimeError("SimpleITK found no valid DICOM series files in extracted directory.")
+                reader.SetFileNames(dicom_names)
+                image = reader.Execute()
+
+                # Reorient to standard anatomical space (RAS)
+                image = sitk.DICOMOrient(image, "RAS")
+                sitk.WriteImage(image, str(cached_nii_path))
+                print(f"[✓] Converted via SimpleITK: {cached_nii_path}")
+            except Exception as sitk_err:
+                raise RuntimeError(f"Both dicom2nifti and SimpleITK failed to convert study {study_id}: {sitk_err}")
 
     return str(cached_nii_path)
-
 
 def wipe_tmp_scratch():
     """Cleans temporary conversion files."""
@@ -301,3 +347,82 @@ def wipe_tmp_scratch():
                 shutil.rmtree(item, ignore_errors=True)
             else:
                 item.unlink(missing_ok=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. In-Memory RADAR Model Loading & Inference
+# ─────────────────────────────────────────────────────────────────────────────
+def warmup_radar_model():
+    """Warms up and loads RADAR model into GPU memory once on startup."""
+    global _PAD_FUNC, _MODEL
+    if _MODEL is not None and _PAD_FUNC is not None:
+        return _PAD_FUNC, _MODEL
+
+    print("[*] Loading and warming up DAMO RADAR into GPU memory...")
+    current_cwd = os.getcwd()
+    try:
+        os.chdir(str(RADAR_INFERENCE_DIR))
+        from RADAR_inference.inference_demo import initialize
+        _PAD_FUNC, _MODEL = initialize()
+        print("[✓] DAMO RADAR ready in GPU memory.")
+    finally:
+        os.chdir(current_cwd)
+
+    return _PAD_FUNC, _MODEL
+
+
+def run_radar_inference(nii_path: str) -> dict:
+    """
+    Runs model inference on the NIfTI volume directly in memory.
+    Returns:
+        dict: {finding_name: probability_float}
+    """
+    pad_func, model = warmup_radar_model()
+
+    from RADAR_inference.inference_demo import evaluate
+
+    with tempfile.TemporaryDirectory() as temp_run_dir:
+        input_dir = os.path.join(temp_run_dir, "input")
+        save_dir = os.path.join(temp_run_dir, "output")
+        os.makedirs(input_dir, exist_ok=True)
+        os.makedirs(save_dir, exist_ok=True)
+
+        # Symlink volume into RADAR's expected input directory
+        symlink_name = os.path.basename(nii_path)
+        symlink_path = os.path.join(input_dir, symlink_name)
+        if not os.path.exists(symlink_path):
+            os.symlink(os.path.abspath(nii_path), symlink_path)
+
+        current_cwd = os.getcwd()
+        try:
+            os.chdir(str(RADAR_INFERENCE_DIR))
+            evaluate(pad_func, model, input_dir, save_dir, save_tag="service")
+        finally:
+            os.chdir(current_cwd)
+
+        csv_path = os.path.join(save_dir, "RADAR_infer_results_service.csv")
+        if not os.path.exists(csv_path):
+            raise RuntimeError(f"Model failed to generate results for volume: {nii_path}")
+
+        df = pd.read_csv(csv_path)
+        if df.empty:
+            return {}
+
+        predictions = {}
+        first_row = df.iloc[0].to_dict()
+
+        for col, val in first_row.items():
+            if col == "file_name":
+                continue
+            # Extract clean English name from column header: "Chinese (English)"
+            if "(" in col and ")" in col:
+                finding_name = col.split("(")[-1].replace(")", "").strip()
+            else:
+                finding_name = col.strip()
+
+            try:
+                predictions[finding_name] = float(val) if val != "" and pd.notna(val) else 0.0
+            except (ValueError, TypeError):
+                continue
+
+    return predictions
